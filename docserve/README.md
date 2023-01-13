@@ -29,7 +29,7 @@ Usage:
 
 ```
 cd docserve
-sudo gem install webrick # pretending everything for asciidoctor is already there
+sudo gem install webrick nokogiri tilt slim concurrent-ruby asciidoctor-diagram pygments.rb
 ruby docserve.rb --docs ~/git/checkmk-docs --styling ~/git/checkmkdocs-styling --cache /tmp/doccache
 firefox http://localhost:8088/
 ```

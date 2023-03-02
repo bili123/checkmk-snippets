@@ -12,6 +12,7 @@ require 'rexml/document'
 require 'net/http'
 require 'net/https'
 require 'uri'
+require 'json'
 begin
 	require 'hunspell'
 rescue LoadError
@@ -33,20 +34,28 @@ $checklinks = 1
 $spelling = 1
 # Pre-build all files (for statistics and faster caching)
 $buildall = 0
-$lunr = Hash.new # Try to retrieve the lunr index from docs.dev or docs
+# Run in batch mode: Build only the documents requested, print out errors and exit accordingly
+$batchmode = 0
+# Auto detect files to build
+$since = nil
+# For posting to slack
+$slackauth = nil
+$channel = nil
 
+$lunr = Hash.new # Try to retrieve the lunr index from docs.dev or docs
 # Cache files here
 $cachedfiles = Hash.new
 # Same for includefiles
 $cachedincludes = Hash.new
 # Cache links, only check once per session, empty string means everything is OK
 $cachedlinks = Hash.new
-# Cache the glossary
-$cachedglossary = Hash.new
 # Prepare dictionaries
 $dictionaries = Hash.new
 # Create a list of files to build at boot
 $prebuild = Array.new
+# For statistics
+$files_built = 0
+$total_errors = Array.new
 
 # FIXME later: Currently we are limited to one branch
 $branches = "localdev"
@@ -86,6 +95,7 @@ $ignorebroken = [
 
 $allowed = [] # Store a complete list of all request paths
 $html = [] # Store a list of all HTML files
+$starttime = Time.now
 
 def create_config
 	opts = OptionParser.new
@@ -99,6 +109,11 @@ def create_config
 	opts.on('--check-links', :REQUIRED) { |i| $checklinks = i.to_i}
 	opts.on('--spelling', :REQUIRED) { |i| $spelling = i.to_i}
 	opts.on('--build-all', :REQUIRED) { |i| $buildall = i.to_i}
+	opts.on('--batch', :REQUIRED) { |i| $batchmode = i.to_i}
+	opts.on('--pre-build', :REQUIRED) { |i| $prebuild = i.split(",")}
+	opts.on('--since', :REQUIRED) { |i| $since = i.to_s}
+	opts.on('--slack-auth', :REQUIRED) { |i| $slackauth = i.to_s}
+	opts.on('--channel', :REQUIRED) { |i| $channel = i.to_s}
 	opts.parse!
 	# Try to find a config file
 	# 1. command line 
@@ -118,8 +133,10 @@ def create_config
 		$injectcss = jcfg["inject-css"] unless jcfg["inject-css"].nil?
 		$injectjs = jcfg["inject-js"] unless jcfg["inject-js"].nil?
 		$checklinks = jcfg["check-links"] unless jcfg["check-links"].nil?
-		$checklinks = jcfg["spelling"] unless jcfg["spelling"].nil?
-		$checklinks = jcfg["build-all"] unless jcfg["build-all"].nil?
+		$spelling = jcfg["spelling"] unless jcfg["spelling"].nil?
+		$buildall = jcfg["build-all"] unless jcfg["build-all"].nil?
+		$prebuild = jcfg["pre-build"] unless jcfg["pre-build"].nil?
+		$since = jcfg["since"] unless jcfg["since"].nil?
 		$stderr.puts jcfg
 	end
 	[ $templates, $basepath, $cachedir ].each { |o|
@@ -128,6 +145,33 @@ def create_config
 			exit 1
 		end
 	}
+end
+
+def post2slack(state, elines)
+	jhash = Hash.new
+	jhash["channel"] = $channel
+	jhash["blocks"] = Array.new
+	if state < 1
+		msg = "No errors found in commits since #{$since}. Continue the good work!"
+	else
+		msg = "Errors found in commits since #{$since}. See details below!"
+	end
+	jhash["blocks"].push( { "type" => "section", "text" => { "type" => "mrkdwn", "text" => msg }} )
+	eblock = "```" + elines.join("\n") + "```"
+	jhash["blocks"].push( { "type" => "section", "text" => { "type" => "mrkdwn", "text" => eblock }} ) if state > 0
+	j = jhash.to_json
+	puts j.to_s
+	unless $channel.nil? || $slackauth.nil?
+		uri = URI('https://slack.com/api/chat.postMessage')
+		Net::HTTP.start(uri.host, uri.port, :use_ssl => uri.scheme == 'https') do |http|
+			request = Net::HTTP::Post.new(uri)
+			request['Content-Type'] = 'application/json'
+			request['Authorization'] = 'Bearer ' + $slackauth
+			request.body = j
+			response = http.request request # Net::HTTPResponse object
+			$stderr.puts "response #{response.body}"
+		end
+	end
 end
 
 # Create a list of all allowed files:
@@ -180,10 +224,8 @@ def create_filelist
 	$allowed.push "/latest/index.html"
 	$allowed.push "/latest/"
 	$allowed.push "/latest"
-	prepare_glossary
 	$allowed.each { |f| $stderr.puts f }
 end
-
 
 def prepare_cache
 	[ "de", "en" ].each { |l|
@@ -200,26 +242,6 @@ def prepare_menu
 		path = "/#{lang}/menu.asciidoc"
 		s = SingleDocFile.new path
 		$cachedfiles[path] = s
-	}
-end
-
-# Prepare the glossary
-def prepare_glossary
-	[ "de", "en" ].each { |lang|
-		$cachedglossary[lang] = Hash.new
-		path = "/#{lang}/glossar.asciidoc"
-		s = SingleDocFile.new path
-		$cachedfiles[path] = s
-		# $stderr.puts s.to_html
-		# doc.css("a").each { |a|
-		# mcont = hdoc.css("div[class='main-nav__content']")[0]
-		doc = Nokogiri::HTML(s.to_html)
-		doc.css("div[class='sect3']").each { |e|
-			id = e.css("span[class='hidden-anchor sr-only']")[0]["id"]
-			$cachedglossary[lang][id] = e.inner_html
-			$allowed.push("/glossary/" + lang + "/" + id) 
-		}
-		
 	}
 end
 
@@ -309,8 +331,28 @@ def get_lunr
 	}
 end
 
-def get_glossary(lang, id)
-	return $cachedglossary[lang][id].to_s
+# Use the git command to identify files modified in a certain time range.
+# The string is passed unmodified, so test compatibility with git log --since='' first.
+def get_modified_since(tdiff)
+	files = Array.new
+	commits = Array.new
+	pwd = Dir.pwd
+	Dir.chdir $basepath
+	unless system "git status"
+		Dir.chdir pwd
+		return nil
+	end
+	gitout = IO.popen("git log --since='#{tdiff}'").readlines
+	gitout.each { |line|
+		if line =~ /^commit\s([0-9a-f]{40})/
+			commits.push $1
+		end
+	}
+	commits.each { |commit|
+		files = files + IO.popen("git diff-tree --no-commit-id --name-only -r '#{commit}'").readlines
+	}
+	Dir.chdir pwd
+	return files.uniq.map { |f| f.strip }
 end
 
 class SingleIncludeFile
@@ -351,10 +393,13 @@ class SingleDocFile
 	@misspelled = [] # Array of misspelled words
 	@errorline = nil # A CSV line containing errors
 	@html_errorline = nil
-	# Initialize, first read
-	def initialize(filename)
+	# Initialize, first read, depth is level of recursion for checking anchors
+	def initialize(filename, depth=0)
 		@filename = filename
 		@misspelled = []
+		@broken_links = Hash.new
+		@anchors = []
+		@depth = depth
 		reread
 	end
 	
@@ -370,21 +415,82 @@ class SingleDocFile
 		end
 	end
 	
+	# Retrieve all (hidden anchors)
+	def get_anchors
+		# $stderr.puts "Searching hidden anchor span"
+		tdoc = Nokogiri::HTML.parse(@html)
+		tdoc.search(".//div[@class='main-nav__content']").remove
+		tdoc.xpath("//span[@class='hidden-anchor sr-only']").each  { |n|
+			# $stderr.puts "Found hidden anchor span: #{n['id'].to_s}"
+			@anchors.push n['id'].to_s
+		}
+		@anchors.uniq!
+	end
+	
+	# Serach for an XML element that uses a ceratin ID. This usually is used as anchor.
+	def search_id(name)
+		found = false
+		tdoc = Nokogiri::HTML.parse(@html)
+		tdoc.search(".//div[@class='main-nav__content']").remove
+		tdoc.xpath("//*[@id='#{name}']").each  { |n|
+			$stderr.puts "Found id with unique name #{name}"
+			@anchors.push name
+			found = true
+		}
+		return found if found == true
+		tdoc.xpath("//*[@id='heading_#{name}']").each  { |n|
+			$stderr.puts "Found id with unique name heading_#{name}"
+			@anchors.push name
+			found = true
+		}
+		return found
+	end
+	
+	# Check anchors in linked documents
+	def check_local_anchors(path, anchor)
+		return true if @depth < 1
+		if $cachedfiles.has_key? "/latest/#{@lang}/#{path}"
+			$stderr.puts "Trying to serve from memory cache..."
+		else
+			filename = "/#{@lang}/#{path}".sub(/\.html$/, ".asciidoc")
+			$stderr.puts "Add file to cache #{filename}"
+			s = SingleDocFile.new(filename, @depth - 1)
+			$cachedfiles[path] = s
+		end
+		return false if $cachedfiles[path].nil?
+		html = $cachedfiles[path].to_html
+		$stderr.puts "Now find the link in the freshly built file. #{path}"
+		return true if $cachedfiles[path].anchors.include? anchor
+		return $cachedfiles[path].search_id(anchor)
+		return false
+	end
+	
 	# Check all links and internal references
 	def check_links(doc)
+		tdoc = doc.clone
+		tdoc.search(".//div[@class='main-nav__content']").remove
 		broken_links = Hash.new
 		return broken_links if $checklinks < 1
-		doc.css("a").each { |a|
+		tdoc.css("a").each { |a|
 			$stderr.puts a unless a["href"].nil?
-			begin
-				href = a["href"].split("#")[0]
-			rescue
+			anchor = ""
+			unless a["href"].nil?
+				toks = a["href"].split("#")
+				href = toks[0]
+				anchor = toks[1] if toks.size > 1
+				# $stderr.puts "Found anchor # #{anchor}" if href.size < 1
+			else
 				href = "."
 			end
-			if $cachedlinks.has_key? href
+			if href =~ /^\./ || href =~ /^\// || href == "" || href.nil? || href =~ /checkmk-docs\/edit\/localdev\// || href =~ /tribe29\.com\// || href =~ /checkmk\.com\// || href =~ /^mailto/
+				if href == "" && anchor.size > 0 
+					# $stderr.puts "Found anchor #{href} # #{anchor}"
+					unless @anchors.include?(anchor) || search_id(anchor)
+						broken_links["#" + anchor] = "this file, target anchor missing"
+					end
+				end
+			elsif $cachedlinks.has_key? href
 				broken_links[href] = $cachedlinks[href] unless $cachedlinks[href] == ""
-			elsif href =~ /^\./ || href =~ /^\// || href == "" || href.nil? || href =~ /checkmk-docs\/edit\/localdev\// || href =~ /tribe29\.com\// || href =~ /checkmk\.com\// || href =~ /^mailto/
-				$cachedlinks[href] = ""
 			elsif href =~ /^[0-9a-z._-]+$/ 
 				# Check local links against file list:
 				fname = "/latest/" + @lang + "/" + href
@@ -392,6 +498,12 @@ class SingleDocFile
 					$stderr.puts "Ignore #{fname} - this is allowed to be broken."
 				elsif $allowed.include? fname
 					$stderr.puts "Found link #{fname} in list of allowed files!"
+					if anchor.size > 0
+						$stderr.puts "Might need to build #{href} # #{anchor}"
+						unless check_local_anchors(href, anchor)
+							broken_links["/latest/" + @lang + "/" + href + "#" + anchor] = "Target anchor missing"
+						end
+					end
 				else
 					$stderr.puts "Missing #{fname} in list of allowed files!"
 					# $cachedlinks[fname] = "404 – File not found"
@@ -422,11 +534,17 @@ class SingleDocFile
 				rescue Errno::ECONNRESET
 					$cachedlinks[href] = "Connection reset by peer"
 					broken_links[href] = $cachedlinks[href]
+				rescue Errno::ECONNREFUSED
+					$cachedlinks[href] = "Connection refused"
+					broken_links[href] = $cachedlinks[href]
 				rescue OpenSSL::SSL::SSLError
 					$cachedlinks[href] = "Unspecified SSL error"
 					broken_links[href] = $cachedlinks[href]
 				rescue URI::InvalidURIError
 					$cachedlinks[href] = "Invalid URI error"
+					broken_links[href] = $cachedlinks[href]
+				rescue Net::OpenTimeout
+					$cachedlinks[href] = "Request timeout"
 					broken_links[href] = $cachedlinks[href]
 				end
 			end
@@ -674,13 +792,13 @@ class SingleDocFile
 		@mtime = check_includes
 		cached_mtime = 0
 		cached_exists = false
-		if File.exists?(outfile) && @html.nil?
-			cached_mtime = File.mtime(outfile).to_i
-			$stderr.puts "Modification time of file on disk: #{cached_mtime}"
-			$stderr.puts "Modification time of asciidoc:    #{@mtime.to_i}"
-			cached_exists = true if cached_mtime > @mtime.to_i && cached_mtime > $menuage[@lang].to_i
-			$stderr.puts "Using file on disk..." if cached_mtime > @mtime.to_i
-		end
+		#if File.exists?(outfile) && @html.nil?
+		#	cached_mtime = File.mtime(outfile).to_i
+		#	$stderr.puts "Modification time of file on disk: #{cached_mtime}"
+		#	$stderr.puts "Modification time of asciidoc:    #{@mtime.to_i}"
+		#	cached_exists = true if cached_mtime > @mtime.to_i && cached_mtime > $menuage[@lang].to_i
+		#	$stderr.puts "Using file on disk..." if cached_mtime > @mtime.to_i
+		#end
 		cached_exists = false if @filename =~ /menu\.asciidoc$/
 		unless cached_exists
 			$stderr.puts "Rebuilding file: " + @filename  
@@ -704,6 +822,7 @@ class SingleDocFile
 		check_spelling
 		count_words
 		check_xml
+		get_anchors
 		@blocked = false
 	end
 	
@@ -744,6 +863,7 @@ class SingleDocFile
 				head.add_child("<style>\n" + File.read(c) + "\n</style>\n") if File.file? c
 			}
 			broken_links = check_links hdoc
+			@broken_links = broken_links
 			total_errors = @errors.size + broken_links.size + @misspelled.size + @missing_includes.size
 			$stderr.puts "Total errors encountered: #{total_errors}"
 			if total_errors > 0
@@ -816,7 +936,7 @@ class SingleDocFile
 		end
 		return html
 	end
-	attr_accessor :mtime, :errorline, :html_errorline, :words, :wordscount, :maxwords, :lang, :filename
+	attr_accessor :mtime, :errorline, :html_errorline, :words, :wordscount, :maxwords, :lang, :filename, :errors, :misspelled, :broken_links, :anchors
 end
 
 class MyServlet < WEBrick::HTTPServlet::AbstractServlet
@@ -838,7 +958,7 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 			else
 				filename = "/" + ptoks[-2] + "/" + ptoks[-1].sub(/\.html$/, ".asciidoc")
 				$stderr.puts "Add file to cache #{filename}"
-				s = SingleDocFile.new filename
+				s = SingleDocFile.new(filename, 1)
 				$cachedfiles[path] = s
 			end
 			html = $cachedfiles[path].to_html
@@ -852,10 +972,6 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 				html = File.read $templates + path
 				suffix = ptoks[-1].split(".")[1] 
 				ctype= $mimetypes[suffix] if $mimetypes.has_key? suffix
-			elsif ptoks.include?("glossary")
-				# /glossary/lang/id
-				html = get_glossary(ptoks[-2], ptoks[-1])
-				ctype= "text/plain"
 			elsif ptoks.include?("images") && ptoks.include?("icons")
 				# Search icons only in the images/icons directory
 				html = File.read $basepath + "/images/icons/" + ptoks[-1]
@@ -927,24 +1043,73 @@ create_config
 prepare_cache
 prepare_menu
 prepare_hunspell
-get_lunr
+
+# Override files to pre-build if git --since is requested
+unless $since.nil?
+	$prebuild = get_modified_since($since)
+end
 
 # Pre-build files requested
-if $buildall > 0 
+if $buildall > 0 || $prebuild.size > 0
+	html2build = []
+	html2build = $prebuild.map { |f| '/latest/' + f.sub(/ˆ\//, '').sub(/asciidoc$/, 'html') }
+	# puts html2build
+	# puts $buildall.to_s
 	create_filelist
 	stime = Time.new.to_i
-	$stderr.puts "requested buildall"
-	$stderr.puts "requested buildall, #{$html.size} documents to build"
+	$stderr.puts "requested buildall, #{$html.size} documents to build" if $buildall > 0
 	$html.each { |f|
-		$stderr.puts "requested buildall, building #{f}"
-		filename = f.sub(/html$/, 'asciidoc').sub(/^\/latest/, '')
-		s = SingleDocFile.new filename
-		$cachedfiles[filename] = s
-		html = $cachedfiles[filename].to_html
+		if html2build.include?(f) || $buildall > 0
+			$stderr.puts "---> INFO: pre-building requested, building #{f}"
+			filename = f.sub(/html$/, 'asciidoc').sub(/^\/latest/, '')
+			s = SingleDocFile.new filename
+			$cachedfiles[filename] = s
+			html = $cachedfiles[filename].to_html
+			$total_errors += $cachedfiles[filename].broken_links.keys
+			$total_errors += $cachedfiles[filename].misspelled
+			$files_built += 1
+		end
 	}
 	duration = Time.now.to_i - stime
 	$stderr.puts "requested buildall, done, building took #{duration}s"
 end
+
+# When batch mode is set, exit here
+if $batchmode > 0
+	errorlines = []
+	state = 1
+	# Errors are encountered, exit non zero:
+	if $total_errors.size > 0
+		errorlines.push "+++> ERROR: prebuilding #{$prebuild} requested, but errors found!"
+		$cachedfiles.each { |f|
+			if f[1].broken_links.keys.size > 0
+				errorlines.push "+++> #{f[1].filename}: #{f[1].broken_links.size} broken links found."
+			end
+			if f[1].misspelled.size > 0
+				errorlines.push "+++> #{f[1].filename}: #{f[1].misspelled.size} misspelled words found."
+			end
+		}
+		errorlines.each { |l| puts l }
+		state = 1
+		post2slack(state, errorlines)
+		exit state
+	end
+	# If building files is requested, but nothing is built...
+	if $prebuild.size > 0 && $files_built < 1
+		errorlines.push "+++> ERROR: prebuilding #{$prebuild} requested, but nothing was built!"
+		errorlines.each { |l| puts l }
+		state = 1
+		exit state
+	end
+	errorlines.push "---> INFO: prebuilding #{$prebuild} requested, done without issues!"
+	errorlines.each { |l| puts l }
+	state = 0
+	post2slack(state, errorlines)
+	exit state
+end
+
+# Retrieve the lunr index
+get_lunr
 
 server = WEBrick::HTTPServer.new(:Port => 8088)
 server.mount "/", MyServlet
@@ -952,5 +1117,4 @@ trap("INT") {
     server.shutdown
 }
 $stderr.puts "docserve is ready now, have fun!"
-# prepare_glossary
 server.start

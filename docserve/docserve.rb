@@ -19,6 +19,9 @@ rescue LoadError
 	$stderr.puts "Hunspell missing, working without spell checking"
 end
 
+# create a struct to hold the node type, some attributes and the content of the node
+Node = Struct.new(:type, :trait, :data)
+
 # require 'rexml/document'
 # require 'asciidoctor'
 
@@ -56,6 +59,10 @@ $prebuild = Array.new
 # For statistics
 $files_built = 0
 $total_errors = Array.new
+# Some files to log to
+$linklog = nil
+# Compare the structure of both languages
+$structure = 0
 
 # FIXME later: Currently we are limited to one branch
 $branches = "localdev"
@@ -114,6 +121,8 @@ def create_config
 	opts.on('--since', :REQUIRED) { |i| $since = i.to_s}
 	opts.on('--slack-auth', :REQUIRED) { |i| $slackauth = i.to_s}
 	opts.on('--channel', :REQUIRED) { |i| $channel = i.to_s}
+	opts.on('--linklog', :REQUIRED) { |i| $linklog = i.to_s}
+	opts.on('--structure', :REQUIRED) { |i| $structure = i.to_i}
 	opts.parse!
 	# Try to find a config file
 	# 1. command line 
@@ -121,7 +130,7 @@ def create_config
 	# 3. program directory
 	if $cfgfile.nil? 
 		[ __dir__ + "/checkmk-docserve.cfg", Dir.home + "/.config/checkmk-docserve.cfg" ].each { |f|
-			$cfgfile = f if File.exists? f
+			$cfgfile = f if File.exist? f
 		}
 	end
 	unless $cfgfile.nil?
@@ -247,7 +256,7 @@ end
 
 # Check whether the german dictionary contains "Äffin" (female monkey) in the correct character set
 def monkey_search(file)
-	return false unless File.exists?(file)
+	return false unless File.exist?(file)
 	File.open(file).each { |line| 
 		begin
 			if line =~ /^Äffin/
@@ -279,7 +288,7 @@ def prepare_hunspell
 			monkey_search($cachedir + "/de_DE.dic")
 		end
 		# Hunspell dictionary has to be converted to UTF-8, better create an own dictionary
-		if File.exists?($cachedir + "/de_DE.dic")
+		if File.exist?($cachedir + "/de_DE.dic")
 			$dictionaries["de"].push Hunspell.new('/usr/share/hunspell/de_DE.aff', $cachedir + "/de_DE.dic")
 			$stderr.puts("hunspell: using #{$cachedir}/de_DE.dic with /usr/share/hunspell/de_DE.aff")
 		else
@@ -299,11 +308,11 @@ def prepare_hunspell
 		# Do nothing.
 	end
 	begin
-		if File.exists?($basepath + "/testing/hunspell/extra_de.dic")
-			$dictionaries["de"].push Hunspell.new('/usr/share/hunspell/de_DE.aff', $basepath + "/testing/hunspell/extra_de.dic") if File.exists?($basepath + "/testing/hunspell/extra_de.dic")
+		if File.exist?($basepath + "/testing/hunspell/extra_de.dic")
+			$dictionaries["de"].push Hunspell.new('/usr/share/hunspell/de_DE.aff', $basepath + "/testing/hunspell/extra_de.dic") if File.exist?($basepath + "/testing/hunspell/extra_de.dic")
 			$stderr.puts("hunspell: using #{$basepath}/testing/hunspell/extra_de.dic with /usr/share/hunspell/de_DE.aff")
 		end
-		if File.exists?($basepath + "/testing/hunspell/extra_en.dic")
+		if File.exist?($basepath + "/testing/hunspell/extra_en.dic")
 			$dictionaries["en"].push Hunspell.new('/usr/share/hunspell/en_US.aff', $basepath + "/testing/hunspell/extra_en.dic")
 			$stderr.puts("hunspell: using #{$basepath}/testing/hunspell/extra_en.dic with /usr/share/hunspell/en_US.aff")
 		end
@@ -400,6 +409,8 @@ class SingleDocFile
 		@broken_links = Hash.new
 		@anchors = []
 		@depth = depth
+		@docstruc = []
+		@structerrors = 0
 		reread
 	end
 	
@@ -474,6 +485,17 @@ class SingleDocFile
 		tdoc.search(".//div[@class='main-nav__content']").remove
 		stats = Array.new
 		return broken_links if $checklinks < 1
+		tdoc.css("img").each { |a|
+			unless a["src"].nil?
+				src = a["src"]
+				if src =~ /^\.\.\//
+					src = src.gsub( /^\.\./, '')
+					unless File.exist?($basepath + src)
+						broken_links[a["src"]] = "404 – File not found"
+					end
+				end
+			end
+		}
 		tdoc.css("a").each { |a|
 			# $stderr.puts a unless a["href"].nil?
 			anchor = ""
@@ -485,7 +507,7 @@ class SingleDocFile
 			else
 				href = "."
 			end
-			if href =~ /^\./ || href =~ /^\// || href == "" || href.nil? || href =~ /checkmk-docs\/edit\/localdev\// || href =~ /tribe29\.com\// || href =~ /checkmk\.com\// || href =~ /^mailto/
+			if href =~ /^\./ || href =~ /^\// || href == "" || href.nil? || href =~ /checkmk-docs\/edit\/localdev\// || href =~ /tribe29\.com\// || href =~ /docs\.checkmk\.com\// || href =~ /^mailto/
 				if href == "" && anchor.size > 0
 					stats.push "Checked anchor in this file: ##{anchor}"
 					# $stderr.puts "Found anchor #{href} # #{anchor}"
@@ -562,11 +584,133 @@ class SingleDocFile
 		}
 		return broken_links
 	end
+    
+    def check_codeboxes(hdoc)
+        broken_verbatim = []
+        nodes = get_codeboxes(hdoc)
+        nodes.each { |n|
+            begin
+                s = n.to_s
+                @nonascii.each { |t| s.gsub!(t, " ") }
+                s.encode(Encoding::ASCII)
+            rescue Encoding::UndefinedConversionError
+                broken_verbatim.push(n)
+            end
+        }
+        return broken_verbatim
+    end
+    
+    def get_codeboxes(hdoc)
+        nodes = []
+        [ ".//script", ".//code" ].each { |r|
+            hdoc.xpath(r).each  { |t|
+                nodes.push(t.to_html)
+            }
+        }
+        return nodes
+    end
+    	
+	def get_imgnodes(h, known)
+		nodes = []
+		h.xpath(".//div[@class='imageblock']").each  { |t|
+			unless known.include? t.to_html
+				nodes.push Node.new("img", nil, t)
+				known.push t.to_html
+			end
+		}
+		h.xpath(".//div[@class='imageblock border']").each  { |t|
+			unless known.include? t.to_html
+				nodes.push Node.new("img", nil, t)
+				known.push t.to_html
+			end
+		}
+		h.xpath(".//span[@class='image-inline']").each  { |t|
+			unless known.include? t.to_html
+				nodes.push Node.new("img", nil, t)
+				known.push t.to_html
+			end
+		}
+		return nodes, known
+	end
+	
+	
+	def check_structure(build=true)
+		to_html if build
+		docstruc = []
+		known = []
+		tdoc = Nokogiri::HTML.parse(@html)
+		tdoc.search(".//div[@class='main-nav__content']").remove
+		tdoc.xpath(".//div[@class='sect1']").each  { |n|
+			h2 = n.search(".//h2")[0]
+			h2['id'] = ''
+			h2.search(".//span").each { |x| x['id'] = '' }
+			docstruc.push Node.new("h2", nil, h2)
+			stripped = n.clone
+			stripped.xpath(".//div[@class='sect2']").each  { |m| stripped.delete m}
+			imgs, known = get_imgnodes(stripped, known)
+			docstruc = docstruc + imgs
+			n.xpath(".//div[@class='sect2']").each  { |m|
+				h3 = m.search(".//h3")[0]
+				h3['id'] = ''
+				h3.search(".//span").each { |x| x['id'] = '' }
+				docstruc.push Node.new("h3", nil, h3)
+				stripped = m.clone
+				imgs, known = get_imgnodes(stripped, known)
+				docstruc = docstruc + imgs
+			  	m.xpath(".//div[@class='sect3']").each  { |o|
+					h4 = o.search(".//h4")[0]
+					h4['id'] = ''
+					h4.search(".//span").each { |x| x['id'] = '' }
+					docstruc.push Node.new("h4", nil, h4)
+					imgs, known = get_imgnodes(o, known)
+					docstruc = docstruc + imgs
+				}
+			}
+			n.xpath(".//table").each  { |t|
+				rows = 0
+				t.xpath(".//tr").each  { |r|
+					rows += 1
+				}
+				docstruc.push Node.new("table", rows, t)
+			}
+			n.xpath(".//ul").each  { |t|
+				li = 0
+				t.xpath(".//li").each  { |r|
+					li += 1
+				}
+				docstruc.push Node.new("ul", li, t)
+			}
+			n.xpath(".//ol").each  { |t|
+				li = 0
+				t.xpath(".//li").each  { |r|
+					li += 1
+				}
+				docstruc.push Node.new("ol", li, t)
+			}
+		}
+		@docstruc = docstruc
+		return docstruc
+	end
+	
+	def get_first_structure_difference(a, b)
+		items = [ a.size, b.size ].max
+		0.upto(items - 1) { |n|
+			puts a[n].type + " " + a[n].trait.to_s + " " + a[n].data.to_s + " " + b[n].type + " " + b[n].trait.to_s + " " + b[n].data.to_s
+			return [ a[n].data, "empty" ] if b[n].nil?
+			return [ "empty", b[n].data ] if a[n].nil?
+			unless (a[n].type == b[n].type && a[n].trait.to_s == b[n].trait.to_s)
+				#puts a[n].type + " " + a[n].trait.to_s + " " + b[n].type + " " + b[n].trait.to_s
+				return [ a[n].data, b[n].data ] # unless (a[n].type == b[n].type && a[n].trait.to_s == b[n].trait.to_s)
+			end
+		}
+		return nil
+	end
 	
 	# Read the includes ans also read ignorewords
 	def read_includes
 		@includes = Array.new
 		@ignored = Array.new
+        @nonascii = Array.new
 		@mtime = File.mtime($basepath + @filename)
 		File.open($basepath + @filename).each { |line|
 			if line =~ /include::(.*?)\[/
@@ -582,6 +726,10 @@ class SingleDocFile
 			if line =~ /\/\/(\s*?)IGNORE/
 				ltoks = line.strip.split
 				@ignored = @ignored + ltoks[2..-1]
+			end
+            if line =~ /\/\/(\s*?)NONASCII/
+				ltoks = line.strip.split
+				@nonascii = @nonascii + ltoks[2..-1]
 			end
 		}
 	end
@@ -803,7 +951,7 @@ class SingleDocFile
 		#@mtime = check_includes
 		cached_mtime = 0
 		cached_exists = false
-		#if File.exists?(outfile) && @html.nil?
+		#if File.exist?(outfile) && @html.nil?
 		#	cached_mtime = File.mtime(outfile).to_i
 		#	$stderr.puts "Modification time of file on disk: #{cached_mtime}"
 		#	$stderr.puts "Modification time of asciidoc:    #{@mtime.to_i}"
@@ -832,6 +980,13 @@ class SingleDocFile
 		@mtime = Time.now
 		@html = File.read(outfile)
 		check_spelling
+		check_structure(false)
+		strf = File.new("#{$cachedir}/#{$latest}/#{@filename}".gsub(/asciidoc$/, "txt"), "w")
+		@docstruc.each { |e|
+			strf.write(e.type + " " + e.trait.to_s)
+			strf.write("\n")
+		}
+		strf.close
 		count_words
 		check_xml
 		get_anchors
@@ -839,7 +994,7 @@ class SingleDocFile
 	end
 	
 	# Decide whether to reread or just dump the cached file
-	def to_html
+	def to_html(otherstructure=nil)
 		$stderr.puts "Checking file: " + $basepath + @filename
 		$stderr.puts "Modification time of asciidoc:             " + check_age.to_s
 		$stderr.puts "Modification time of file in memory cache: " + @mtime.to_s
@@ -859,6 +1014,14 @@ class SingleDocFile
 		@errorline = nil
 		@html_errorline = nil
 		unless @filename =~ /menu\.asciidoc$/
+			mystructure = nil
+			@structerrors = 0
+			struct_delta = nil
+			unless otherstructure.nil?
+				mystructure = check_structure(false)
+				struct_delta = get_first_structure_difference(mystructure, otherstructure)
+				@structerrors = 1 unless struct_delta.nil?
+			end
 			hdoc = Nokogiri::HTML.parse html
 			head  = hdoc.at_css "head"
 			cnode = hdoc.css("div[id='preamble']")[0]
@@ -879,7 +1042,8 @@ class SingleDocFile
 			}
 			broken_links = check_links hdoc
 			@broken_links = broken_links
-			total_errors = @errors.size + broken_links.size + @misspelled.size + @missing_includes.size
+            broken_code = check_codeboxes hdoc
+			total_errors = @errors.size + broken_links.size + @misspelled.size + @missing_includes.size + structerrors + broken_code.size
 			$stderr.puts "Total errors encountered: #{total_errors}"
 			if total_errors > 0
 				hname = @filename.sub(/asciidoc$/, 'html')
@@ -921,6 +1085,19 @@ class SingleDocFile
 					@errorline = @errorline + "0;\n"
 					@html_errorline = @html_errorline + "<td>0</td></tr>\n"
 				end
+                if broken_code.size > 0
+                    enode += "<h3>Found codeboxes with non ASCII chars</h3><p>"
+                    broken_code.each { |n|
+                        enode += "<pre class='pygments highlight'>" + n + '</pre>'
+                    }
+                end
+				if structerrors > 0
+					enode += "<h3>Structure not matching</h3><p><b>This:</b> "
+					enode += struct_delta[0].to_html
+					enode += "</p><p><b>Other:</b> "
+					enode += struct_delta[1].to_html
+					enode += "</p>"
+				end
 				enode += "</div>\n"
 				if cnode.nil?
 					$stderr.puts "Preamble not found!"
@@ -951,7 +1128,7 @@ class SingleDocFile
 		end
 		return html
 	end
-	attr_accessor :mtime, :errorline, :html_errorline, :words, :wordscount, :maxwords, :lang, :filename, :errors, :misspelled, :broken_links, :anchors
+	attr_accessor :mtime, :errorline, :html_errorline, :words, :wordscount, :maxwords, :lang, :filename, :errors, :misspelled, :broken_links, :anchors, :docstruc, :structerrors
 end
 
 class MyServlet < WEBrick::HTTPServlet::AbstractServlet
@@ -968,6 +1145,7 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 		# Re-create the filelist if a file not listed is requested, an image or an asciidoc file might have been added
 		create_filelist unless $allowed.include? path.strip
 		if $html.include? path.strip
+			otherstruc = nil
 			if $cachedfiles.has_key? path.strip
 				$stderr.puts "Trying to serve from memory cache... #{path.strip}"
 			else
@@ -976,7 +1154,21 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 				s = SingleDocFile.new(filename, 1)
 				$cachedfiles[path] = s
 			end
-			html = $cachedfiles[path].to_html
+			if $structure > 0
+				otherstruc = []
+				otherlangs = [ "de", "en" ] - [ ptoks[-2] ]
+				otherfile = "/" + ptoks[-3] + "/" + otherlangs[0] + "/" + ptoks[-1]
+				if $html.include?("/" + ptoks[-3] + "/" + otherlangs[0] + "/" + ptoks[-1])
+					unless $cachedfiles.has_key? otherfile
+						otherfilename = "/" + otherlangs[0] + "/" + ptoks[-1].sub(/\.html$/, ".asciidoc")
+						osdoc = SingleDocFile.new(otherfilename, 1)
+						$cachedfiles[otherfile] = osdoc
+					end
+					otherstruc = $cachedfiles[otherfile].check_structure
+				end
+				puts otherstruc.join(", ")
+ 			end
+			html = $cachedfiles[path].to_html(otherstruc)
 			response.status = status
 			response.content_type = "text/html"
 			response.body = html
@@ -1103,6 +1295,9 @@ if $batchmode > 0
 			end
 			if f[1].misspelled.size > 0
 				errorlines.push "+++> #{f[1].filename}: #{f[1].misspelled.size} misspelled words found: #{f[1].misspelled.join(', ')}"
+			end
+			if f[1].structerrors > 0
+				errorlines.push "+++> #{f[1].filename}: Document structure not matching"
 			end
 		}
 		errorlines.each { |l| puts l }

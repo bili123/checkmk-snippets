@@ -1,7 +1,7 @@
 #!/usr/bin/ruby
 # encoding: utf-8
 #
-# (C) 2022 Mattias Schlenker for tribe29 GmbH
+# (C) 2022, 2023 Mattias Schlenker for Checkmk GmbH
 
 require 'webrick'
 require 'fileutils'
@@ -21,6 +21,8 @@ end
 
 # create a struct to hold the node type, some attributes and the content of the node
 Node = Struct.new(:type, :trait, :data)
+# create a struct to hold information about links
+Link = Struct.new(:url, :ok, :lastcheck, :statuscode, :errorline)
 
 # require 'rexml/document'
 # require 'asciidoctor'
@@ -44,6 +46,16 @@ $since = nil
 # For posting to slack
 $slackauth = nil
 $channel = nil
+# Some files to log to
+$linklog = nil
+# Compare the structure of both languages
+$structure = 0
+# Build the SaaS User Guide
+$saas = 0
+$newdir = nil
+# Create a list of files to build at boot
+$prebuild = Array.new
+
 
 $lunr = Hash.new # Try to retrieve the lunr index from docs.dev or docs
 # Cache files here
@@ -52,17 +64,13 @@ $cachedfiles = Hash.new
 $cachedincludes = Hash.new
 # Cache links, only check once per session, empty string means everything is OK
 $cachedlinks = Hash.new
+$linksusedby = Hash.new
 # Prepare dictionaries
 $dictionaries = Hash.new
-# Create a list of files to build at boot
-$prebuild = Array.new
 # For statistics
 $files_built = 0
 $total_errors = Array.new
-# Some files to log to
-$linklog = nil
-# Compare the structure of both languages
-$structure = 0
+
 
 # FIXME later: Currently we are limited to one branch
 $branches = "localdev"
@@ -93,7 +101,8 @@ $mimetypes = {
 	"svg" => "image/svg+xml",
 	"ico" => "image/vnd.microsoft.icon",
 	"json" => "application/json",
-	"csv" => "text/csv"
+	"csv" => "text/csv",
+    "txt" => "text/plain",
 }
 # Links that are internally used, but redirected externaly.
 $ignorebroken = [
@@ -102,6 +111,7 @@ $ignorebroken = [
 
 $allowed = [] # Store a complete list of all request paths
 $html = [] # Store a list of all HTML files
+$images = [] # Store a list of all images
 $starttime = Time.now
 
 def create_config
@@ -123,6 +133,8 @@ def create_config
 	opts.on('--channel', :REQUIRED) { |i| $channel = i.to_s}
 	opts.on('--linklog', :REQUIRED) { |i| $linklog = i.to_s}
 	opts.on('--structure', :REQUIRED) { |i| $structure = i.to_i}
+    opts.on('--saas', :REQUIRED) { |i| $saas = i.to_i}
+    opts.on('--new-dir-structure', :REQUIRED) { |i| $newdir = i.to_i}
 	opts.parse!
 	# Try to find a config file
 	# 1. command line 
@@ -146,6 +158,9 @@ def create_config
 		$buildall = jcfg["build-all"] unless jcfg["build-all"].nil?
 		$prebuild = jcfg["pre-build"] unless jcfg["pre-build"].nil?
 		$since = jcfg["since"] unless jcfg["since"].nil?
+        $structure = jcfg["structure"] unless jcfg["structure"].nil?
+        $saas = jcfg["saas"] unless jcfg["saas"].nil?
+        $saas = jcfg["newdir"] unless jcfg["newdir"].nil?
 		$stderr.puts jcfg
 	end
 	[ $templates, $basepath, $cachedir ].each { |o|
@@ -183,33 +198,78 @@ def post2slack(state, elines)
 	end
 end
 
+def identify_dir_structure
+    if File.directory? "#{$basepath}/src/onprem/en"
+        $newdir = 1
+    elsif File.directory? "#{$basepath}/en"
+        $newdir = 0
+    end
+end
+
+def create_softlinks
+    return if $newdir < 1
+    subdirs = [ "includes", "common", "onprem" ]
+    subdirs = [ "includes", "common", "saas" ] if $saas > 0
+    $onthispage.each { |lang, s| 
+        FileUtils.mkdir_p "#{$cachedir}/src/#{lang}"
+        subdirs.each { |d|
+            FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.a*doc"), "#{$cachedir}/src/#{lang}", force: true)
+            FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.xml"), "#{$cachedir}/src/#{lang}", force: true)
+            FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.txt"), "#{$cachedir}/src/#{lang}", force: true)
+        }
+        FileUtils.ln_s(Dir.glob("#{$basepath}/src/code/*.a*doc"), "#{$cachedir}/src/#{lang}", force: true)
+    }
+end
+
 # Create a list of all allowed files:
 def create_filelist
 	$allowed = []
+    if $newdir < 1
 	# Allow all asciidoc files except includes and menus
-	$onthispage.each { |lang, s| 
-		Dir.entries($basepath + "/" + lang).each { |f|
-			if f =~ /\.asciidoc/ 
-				fname = "/latest/" + lang + "/" + f.sub(/\.asciidoc$/, ".html")
-				jname = "/last_change/latest/" + lang + "/" + f.sub(/\.asciidoc$/, ".html")
-				unless f =~ /^(include|menu)/
-					$allowed.push fname
-					$allowed.push jname
-					$html.push fname
-				end
-			end
-		}
-	}
+        $onthispage.each { |lang, s| 
+            Dir.entries($basepath + "/" + lang).each { |f|
+                if f =~ /\.asciidoc/ 
+                    fname = "/latest/" + lang + "/" + f.sub(/\.asciidoc$/, ".html")
+                    jname = "/last_change/latest/" + lang + "/" + f.sub(/\.asciidoc$/, ".html")
+                    unless f =~ /^(include|menu)/
+                        $allowed.push fname
+                        $allowed.push jname
+                        $html.push fname
+                    end
+                end
+            }
+        }
+    else
+        subdirs = [ "common", "onprem" ]
+        subdirs = [ "common", "saas" ] if $saas > 0
+        $onthispage.each { |lang, s|
+            subdirs.each { |d|
+                Dir.entries($basepath + "/src/" + d + "/" + lang).each { |f|
+                    if f =~ /\.asciidoc/ 
+                        fname = "/latest/" + lang + "/" + f.sub(/\.asciidoc$/, ".html")
+                        jname = "/last_change/latest/" + lang + "/" + f.sub(/\.asciidoc$/, ".html")
+                        unless f =~ /^(include|menu)/
+                            $allowed.push fname
+                            $allowed.push jname
+                            $html.push fname
+                        end
+                    end
+                }
+            }
+        }
+    end
 	# Allow all images, but change their paths to include the language
 	Dir.entries($basepath + "/images").each { |f|
 		if f =~ /\.(png|jpeg|jpg|svg)$/
 			$allowed.push "/latest/images/" + f
+            $images.push "../images/" + f
 		end
 	}
 	# Allow all icons
 	Dir.entries($basepath + "/images/icons").each { |f|
 		if f =~ /\.(png|jpeg|jpg|svg)$/
 			$allowed.push "/latest/images/icons/" + f
+            $images.push "../images/icons/" + f
 		end
 	}
 	# Allow all files in any subdirectory in assets
@@ -227,9 +287,13 @@ def create_filelist
 		$allowed.push "/latest/lunr.index.#{lang}.js"
 	}
 	$allowed.push "/favicon.ico"
+    $allowed.push "/favicon.png"
 	$allowed.push "/errors.csv"
 	$allowed.push "/errors.html"
 	$allowed.push "/wordcount.html"
+    $allowed.push "/images.html"
+    $allowed.push "/images.txt"
+    $allowed.push "/links.html"
 	$allowed.push "/latest/index.html"
 	$allowed.push "/latest/"
 	$allowed.push "/latest"
@@ -250,7 +314,7 @@ def prepare_menu
 	[ "de", "en" ].each { |lang|
 		path = "/#{lang}/menu.asciidoc"
 		s = SingleDocFile.new path
-		$cachedfiles[path] = s
+		$cachedfiles[path.gsub('.asciidoc', '.html')] = s
 	}
 end
 
@@ -378,7 +442,12 @@ class SingleIncludeFile
 	attr_accessor :mtime
 	
 	def check_age
-		@mtime = File.mtime($basepath + @filename)
+        srcpath = $basepath
+        create_softlinks
+        if $newdir > 0
+            srcpath = "#{$cachedir}/src"
+        end
+		@mtime = File.mtime(srcpath + @filename)
 		return @mtime
 	end
 	
@@ -410,6 +479,7 @@ class SingleDocFile
 		@anchors = []
 		@depth = depth
 		@docstruc = []
+        @images = []
 		@structerrors = 0
 		reread
 	end
@@ -438,7 +508,7 @@ class SingleDocFile
 		@anchors.uniq!
 	end
 	
-	# Serach for an XML element that uses a ceratin ID. This usually is used as anchor.
+	# Search for an XML element that uses a ceratin ID. This usually is used as anchor.
 	def search_id(name)
 		found = false
 		tdoc = Nokogiri::HTML.parse(@html)
@@ -461,19 +531,20 @@ class SingleDocFile
 	def check_local_anchors(path, anchor)
 		return true if @depth < 1
 		fullpath = "/latest/#{@lang}/#{path}"
-		if $cachedfiles.has_key? fullpath
-			$stderr.puts "Trying to serve from memory cache... #{fullpath}"
+        spath = "/#{@lang}/#{path}"
+		if $cachedfiles.has_key? spath
+			$stderr.puts "Trying to serve from memory cache... #{path} #{spath}"
 		else
 			filename = "/#{@lang}/#{path}".sub(/\.html$/, ".asciidoc")
 			#$stderr.puts "Add file to cache #{filename}"
 			s = SingleDocFile.new(filename, @depth - 1)
-			$cachedfiles[fullpath] = s
+			$cachedfiles[spath] = s
 		end
-		return false if $cachedfiles[fullpath].nil?
+		return false if $cachedfiles[spath].nil?
 		#html = $cachedfiles[fullpath].to_html
-		$stderr.puts "Now find the link in the freshly built file. #{fullpath}"
-		return true if $cachedfiles[fullpath].anchors.include? anchor
-		return $cachedfiles[fullpath].search_id(anchor)
+		$stderr.puts "Now find the link in the freshly built file. #{spath}"
+		return true if $cachedfiles[spath].anchors.include? anchor
+		return $cachedfiles[spath].search_id(anchor)
 		return false
 	end
 	
@@ -483,11 +554,13 @@ class SingleDocFile
 		return broken_links if @depth < 1
 		tdoc = doc.clone
 		tdoc.search(".//div[@class='main-nav__content']").remove
+        tdoc.search(".//div[@class='main-nav__utils']").remove
 		stats = Array.new
 		return broken_links if $checklinks < 1
 		tdoc.css("img").each { |a|
 			unless a["src"].nil?
 				src = a["src"]
+                @images.push src
 				if src =~ /^\.\.\//
 					src = src.gsub( /^\.\./, '')
 					unless File.exist?($basepath + src)
@@ -507,7 +580,7 @@ class SingleDocFile
 			else
 				href = "."
 			end
-			if href =~ /^\./ || href =~ /^\// || href == "" || href.nil? || href =~ /checkmk-docs\/edit\/localdev\// || href =~ /tribe29\.com\// || href =~ /docs\.checkmk\.com\// || href =~ /^mailto/
+			if href == 'https://checkmk.com' || href =~ /^\./ || href =~ /^\// || href == "" || href.nil? || href =~ /checkmk-docs\/edit\/localdev\// || href =~ /docs\.checkmk\.com\// || href =~ /^mailto/
 				if href == "" && anchor.size > 0
 					stats.push "Checked anchor in this file: ##{anchor}"
 					# $stderr.puts "Found anchor #{href} # #{anchor}"
@@ -517,8 +590,9 @@ class SingleDocFile
 				end
 			elsif $cachedlinks.has_key? href
 				stats.push "Used cached link: #{href}"
-				broken_links[href] = $cachedlinks[href] unless $cachedlinks[href] == ""
-			elsif href =~ /^[0-9a-z._-]+$/ 
+				broken_links[href] = $cachedlinks[href].errorline unless $cachedlinks[href].ok == true
+                $linksusedby[href].push @filename.sub(/asciidoc$/, 'html') unless $linksusedby[href].include? @filename.sub(/asciidoc$/, 'html')
+			elsif href =~ /^[0-9a-z._-]+$/
 				# Check local links against file list:
 				fname = "/latest/" + @lang + "/" + href
 				if $ignorebroken.include? href
@@ -527,6 +601,9 @@ class SingleDocFile
 					# $stderr.puts "Found link #{fname} in list of allowed files!"
 					if anchor.size > 0 && @depth > 0
 						stats.push "Might need to build #{href} # #{anchor}"
+                        if anchor =~ /^_/
+                            broken_links["/latest/" + @lang + "/" + href + "#" + anchor] = "Target anchor is forbidden automatic style"
+                        end
 						unless check_local_anchors(href, anchor)
 							broken_links["/latest/" + @lang + "/" + href + "#" + anchor] = "Target anchor missing"
 						end
@@ -537,43 +614,69 @@ class SingleDocFile
 					broken_links["/latest/" + @lang + "/" + href] = "404 – File not found"
 				end
 			else
+                if $linksusedby.has_key? href 
+                    $linksusedby[href].push @filename.sub(/asciidoc$/, 'html') unless $linksusedby[href].include? @filename.sub(/asciidoc$/, 'html')
+                else
+                    $linksusedby[href] = [ @filename.sub(/asciidoc$/, 'html') ]
+                end
+                $cachedlinks[href] = Link.new(href, true, Time.now.to_i, -1, '')
 				begin
 					stats.push "Retrieving #{href}"
 					headers = nil
 					url = URI(href)
 					resp = Net::HTTP.get_response(url)
 					$stderr.puts resp
-					$cachedlinks[href] = ""
-					if resp.code.to_i > 400 && resp.code.to_i < 500
-						$cachedlinks[href] = resp.code
-						$cachedlinks[href] = "404 – File not found" if resp.code == "404"
-						$cachedlinks[href] = "401 – Unauthorized" if resp.code == "401"
-						broken_links[href] = $cachedlinks[href]
+                    # Struct.new(:url, :ok, :lastcheck, :statuscode, :errorline)
+					if [ 401, 402 ].include?(resp.code.to_i) || (resp.code.to_i > 403 && resp.code.to_i <= 500)
+						$cachedlinks[href][:statuscode] = resp.code.to_i
+                        $cachedlinks[href][:ok] = false
+						$cachedlinks[href][:errorline] = "404 – File not found" if resp.code == "404"
+                        $cachedlinks[href][:errorline] = "500 – Internal Server Error" if resp.code == "500"
+						$cachedlinks[href][:errorline] = "401 – Unauthorized" if resp.code == "401"
+						broken_links[href] = $cachedlinks[href][:errorline]
+                    elsif resp.code.to_i > 0 && resp.code.to_i <= 400
+                        $cachedlinks[href][:statuscode] = resp.code.to_i
 					end
+                    if resp.code.to_i == 403
+                        $cachedlinks[href][:statuscode] = resp.code.to_i
+                        $stderr.puts "WARNING: #{href} answers with 403"
+                    end
 				rescue ArgumentError
-					$cachedlinks[href] = "Could not convert URI"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Could not convert URI"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				rescue EOFError
-					$cachedlinks[href] = "Could not parse response header"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Could not parse response header"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				rescue SocketError
-					$cachedlinks[href] = "Host not found or port unavailable"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Host not found or port unavailable"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				rescue Errno::ECONNRESET
-					$cachedlinks[href] = "Connection reset by peer"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Connection reset by peer"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				rescue Errno::ECONNREFUSED
-					$cachedlinks[href] = "Connection refused"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Connection refused"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				rescue OpenSSL::SSL::SSLError
-					$cachedlinks[href] = "Unspecified SSL error"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Unspecified SSL error"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				rescue URI::InvalidURIError
-					$cachedlinks[href] = "Invalid URI error"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Invalid URI error"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				rescue Net::OpenTimeout
-					$cachedlinks[href] = "Request timeout"
-					broken_links[href] = $cachedlinks[href]
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "Request timeout"
+					broken_links[href] = $cachedlinks[href][:errorline]
+                rescue Errno::EHOSTUNREACH
+                    $cachedlinks[href][:ok] = false
+					$cachedlinks[href][:errorline] = "No route to host"
+					broken_links[href] = $cachedlinks[href][:errorline]
 				end
 			end
 		}
@@ -589,9 +692,18 @@ class SingleDocFile
         broken_verbatim = []
         nodes = get_codeboxes(hdoc)
         nodes.each { |n|
+            links = 0
+            Nokogiri::HTML5.fragment(n).css("a").each { |a|
+                links += 1
+            }
+            broken_verbatim.push(n) if links > 0
             begin
-                s = n.to_s
-                @nonascii.each { |t| s.gsub!(t, " ") }
+                s = n.clone.to_s
+                @nonascii.each { |t| s.gsub!(t, '') }
+                s.gsub!(/[[:space:]]+/, '')
+                s.gsub!(/[[:word:]]+/, '')
+                s.gsub!('…​', '')
+                s.gsub!('…', '')
                 s.encode(Encoding::ASCII)
             rescue Encoding::UndefinedConversionError
                 broken_verbatim.push(n)
@@ -609,30 +721,6 @@ class SingleDocFile
         }
         return nodes
     end
-    	
-	def get_imgnodes(h, known)
-		nodes = []
-		h.xpath(".//div[@class='imageblock']").each  { |t|
-			unless known.include? t.to_html
-				nodes.push Node.new("img", nil, t)
-				known.push t.to_html
-			end
-		}
-		h.xpath(".//div[@class='imageblock border']").each  { |t|
-			unless known.include? t.to_html
-				nodes.push Node.new("img", nil, t)
-				known.push t.to_html
-			end
-		}
-		h.xpath(".//span[@class='image-inline']").each  { |t|
-			unless known.include? t.to_html
-				nodes.push Node.new("img", nil, t)
-				known.push t.to_html
-			end
-		}
-		return nodes, known
-	end
-	
 	
 	def check_structure(build=true)
 		to_html if build
@@ -640,66 +728,58 @@ class SingleDocFile
 		known = []
 		tdoc = Nokogiri::HTML.parse(@html)
 		tdoc.search(".//div[@class='main-nav__content']").remove
-		tdoc.xpath(".//div[@class='sect1']").each  { |n|
-			h2 = n.search(".//h2")[0]
-			h2['id'] = ''
-			h2.search(".//span").each { |x| x['id'] = '' }
-			docstruc.push Node.new("h2", nil, h2)
-			stripped = n.clone
-			stripped.xpath(".//div[@class='sect2']").each  { |m| stripped.delete m}
-			imgs, known = get_imgnodes(stripped, known)
-			docstruc = docstruc + imgs
-			n.xpath(".//div[@class='sect2']").each  { |m|
-				h3 = m.search(".//h3")[0]
-				h3['id'] = ''
-				h3.search(".//span").each { |x| x['id'] = '' }
-				docstruc.push Node.new("h3", nil, h3)
-				stripped = m.clone
-				imgs, known = get_imgnodes(stripped, known)
-				docstruc = docstruc + imgs
-			  	m.xpath(".//div[@class='sect3']").each  { |o|
-					h4 = o.search(".//h4")[0]
-					h4['id'] = ''
-					h4.search(".//span").each { |x| x['id'] = '' }
-					docstruc.push Node.new("h4", nil, h4)
-					imgs, known = get_imgnodes(o, known)
-					docstruc = docstruc + imgs
-				}
-			}
-			n.xpath(".//table").each  { |t|
-				rows = 0
-				t.xpath(".//tr").each  { |r|
+        tmpstruc = tdoc.search('*') #.map(&:name)
+        # puts tmpstruc.map(&:name)
+        tmpstruc.each { |e|
+            if [ "h2", "h3", "h4" ].include? e.name
+                trait = nil
+                trait = e['id'] unless e['id'] =~ /^(_|heading__)/
+                docstruc.push Node.new(e.name, trait, e)
+            elsif e.name == "div" && ( e['class'] == 'imageblock' || e['class'] == 'imageblock border' )
+                docstruc.push Node.new("imageblock", e['src'], e)
+            elsif e.name == "span" && e['class'] == 'image-inline'
+                docstruc.push Node.new("imageinline", e['src'], e)
+            elsif e.name == "div" && e['class'] == 'paragraph'
+                docstruc.push Node.new("paragraph", nil, e)
+            elsif e.name == "table"
+                rows = 0
+				e.xpath(".//tr").each  { |r|
 					rows += 1
 				}
-				docstruc.push Node.new("table", rows, t)
-			}
-			n.xpath(".//ul").each  { |t|
-				li = 0
-				t.xpath(".//li").each  { |r|
+				docstruc.push Node.new("table", rows, e)
+            elsif e.name == "ul"
+                li = 0
+				e.xpath(".//li").each  { |r|
 					li += 1
 				}
-				docstruc.push Node.new("ul", li, t)
-			}
-			n.xpath(".//ol").each  { |t|
-				li = 0
-				t.xpath(".//li").each  { |r|
+				docstruc.push Node.new("ul", li, e)
+            elsif e.name == "ol"
+                li = 0
+				e.xpath(".//li").each  { |r|
 					li += 1
 				}
-				docstruc.push Node.new("ol", li, t)
-			}
-		}
-		@docstruc = docstruc
-		return docstruc
+				docstruc.push Node.new("ol", li, e)
+            elsif e.name == "div" && e['class'] == 'listingblock'
+                docstruc.push Node.new("listingblock", nil, e)
+            end
+        }
+        @docstruc = docstruc
+        # puts docstruc
+        return docstruc
 	end
 	
 	def get_first_structure_difference(a, b)
 		items = [ a.size, b.size ].max
 		0.upto(items - 1) { |n|
-			puts a[n].type + " " + a[n].trait.to_s + " " + a[n].data.to_s + " " + b[n].type + " " + b[n].trait.to_s + " " + b[n].data.to_s
-			return [ a[n].data, "empty" ] if b[n].nil?
-			return [ "empty", b[n].data ] if a[n].nil?
+            # puts "A: #{a}, B: #{a}"
+            if b[n].nil?
+                return [ a[n].data, Nokogiri::XML::DocumentFragment.parse("<b>Empty</b>") ]
+            end
+            if a[n].nil?
+                return [ Nokogiri::XML::DocumentFragment.parse("<b>Empty</b>"), b[n].data ]
+            end
+            puts a[n].type + " " + a[n].trait.to_s + " vs. " + b[n].type + " " + b[n].trait.to_s
 			unless (a[n].type == b[n].type && a[n].trait.to_s == b[n].trait.to_s)
-				#puts a[n].type + " " + a[n].trait.to_s + " " + b[n].type + " " + b[n].trait.to_s
 				return [ a[n].data, b[n].data ] # unless (a[n].type == b[n].type && a[n].trait.to_s == b[n].trait.to_s)
 			end
 		}
@@ -711,12 +791,17 @@ class SingleDocFile
 		@includes = Array.new
 		@ignored = Array.new
         @nonascii = Array.new
-		@mtime = File.mtime($basepath + @filename)
-		File.open($basepath + @filename).each { |line|
+        srcpath = $basepath
+        create_softlinks
+        if $newdir > 0
+            srcpath = "#{$cachedir}/src"
+        end
+		@mtime = File.mtime(srcpath + @filename)
+		File.open(srcpath + @filename).each { |line|
 			if line =~ /include::(.*?)\[/
 				ifile = $1
 				ipath = "/" + @lang + "/" + ifile
-				if File.file?($basepath + ipath)
+				if File.exist?(srcpath + ipath)
 					$cachedincludes[ipath] = SingleIncludeFile.new ipath
 				else
 					$stderr.puts "Include file is missing: #{ipath}"
@@ -736,9 +821,14 @@ class SingleDocFile
 	
 	def check_includes
 		latest_include = Time.at 0
+        srcpath = $basepath
+        create_softlinks
+        if $newdir > 0
+            srcpath = "#{$cachedir}/src"
+        end
 		@missing_includes = Array.new
 		@includes.each { |i|
-			if File.file?($basepath + i) && $cachedincludes.has_key?(i)
+			if File.file?(srcpath + i) && $cachedincludes.has_key?(i)
 				mtime = $cachedincludes[i].check_age
 				latest_include = mtime if mtime > latest_include
 			else
@@ -748,9 +838,9 @@ class SingleDocFile
 		if @filename =~ /index\.asciidoc$/
 			# XML files mit column layout and featured topics are treated as includes as well
 			# TXT files with most recent updated etc. might be manually updated
-			Dir.entries($basepath + "/" + @lang).each { |f|
+			Dir.entries(srcpath + "/" + @lang).each { |f|
 				if f =~ /xml$/ || f =~ /txt$/
-					tmpmtime = File.mtime($basepath + "/" + @lang + "/" + f)
+					tmpmtime = File.mtime(srcpath + "/" + @lang + "/" + f)
 					latest_include = tmpmtime if tmpmtime > latest_include
 				end
 			}
@@ -760,7 +850,12 @@ class SingleDocFile
 	
 	def check_age
 		imtime = check_includes
-		fmtime = File.mtime($basepath + @filename)
+        srcpath = $basepath
+        create_softlinks
+        if $newdir > 0
+            srcpath = "#{$cachedir}/src"
+        end
+		fmtime = File.mtime(srcpath + @filename)
 		return imtime if imtime > fmtime
 		return fmtime
 	end
@@ -801,7 +896,7 @@ class SingleDocFile
 				valid = true if sp.spellcheck(checkw.strip) == true
 				valid = true if sp.spellcheck(checkw.strip.downcase) == true
 			}
-			puts "+#{checkw}+" if valid == false
+			$stderr.puts "Missspelled word in #{@filename}: +#{checkw}+" if valid == false
 			@misspelled.push(checkw.strip) if valid == false
 		}
 	end
@@ -843,12 +938,17 @@ class SingleDocFile
 	end
 	
 	def nicify_startpage(hdoc) # expects HTML tree as Nokogiri object
+        srcpath = $basepath
+        create_softlinks
+        if $newdir > 0
+            srcpath = "#{$cachedir}/src"
+        end
 		begin
 			# Extract the featured topic overlay
-			featured = Nokogiri::HTML.parse(File.read($basepath + "/" + @lang + "/featured_000.xml"))
+			featured = Nokogiri::HTML.parse(File.read(srcpath + "/" + @lang + "/featured_000.xml"))
 			overlay = featured.css("div[id='topicopaque']")
 			# Extract the new startpage layout
-			landing = Nokogiri::HTML.parse(File.read($basepath + "/" + @lang + "/landingpage.xml"))
+			landing = Nokogiri::HTML.parse(File.read(srcpath + "/" + @lang + "/landingpage.xml"))
 			header = landing.css("div[id='header']")
 			# Extract the column for featured topic
 			ftcol = featured.css("div[id='featuredtopic']")[0]
@@ -908,8 +1008,13 @@ class SingleDocFile
 	# Convert the auto generated file list to HTML list
 	def get_autolist(name, hdoc)
 		h = nil
+        srcpath = $basepath
+        create_softlinks
+        if $newdir > 0
+            srcpath = "#{$cachedir}/src"
+        end
 		ul = Nokogiri::XML::Node.new "ul", hdoc
-		File.open($basepath + "/" + @lang + "/" + name + ".txt").each { |line|
+		File.open(srcpath + "/" + @lang + "/" + name + ".txt").each { |line|
 			if line =~ /^\#/ || line.strip == ""
 				# do nothing
 			elsif line =~ /^=\s/
@@ -917,7 +1022,7 @@ class SingleDocFile
 				h.content = line.strip.sub(/^=\s/, "")
 			else
 				fname = line.strip
-				File.open($basepath + "/" + @lang + "/" + fname + ".asciidoc").each { |aline|
+				File.open(srcpath + "/" + @lang + "/" + fname + ".asciidoc").each { |aline|
 					if aline =~ /^=\s/
 						li = Nokogiri::XML::Node.new "li", hdoc
 						a = Nokogiri::XML::Node.new "a", hdoc
@@ -951,6 +1056,9 @@ class SingleDocFile
 		#@mtime = check_includes
 		cached_mtime = 0
 		cached_exists = false
+        preproc = '-a onprem'
+        preproc = '-a saas' if $saas > 0
+        menu = 'menu.asciidoc'
 		#if File.exist?(outfile) && @html.nil?
 		#	cached_mtime = File.mtime(outfile).to_i
 		#	$stderr.puts "Modification time of file on disk: #{cached_mtime}"
@@ -963,11 +1071,16 @@ class SingleDocFile
 			$stderr.puts "Rebuilding file: " + @filename  
 			onthispage = $onthispage[@lang]
 			comm = ""
+            srcpath = $basepath
+            create_softlinks
+            if $newdir > 0
+                srcpath = "#{$cachedir}/src"
+            end
 			if @filename =~ /menu\.asciidoc$/
-				comm = "asciidoctor -T \"#{$templates}/templates/index\" -E slim \"#{$basepath}/#{@lang}/menu.asciidoc\" -D \"#{$cachedir}/#{$latest}/#{@lang}\""
+				comm = "asciidoctor -T \"#{$templates}/templates/index\" -E slim \"#{srcpath}/#{@lang}/#{menu}\" -D \"#{$cachedir}/#{$latest}/#{@lang}\""
 				$stderr.puts comm
 			else
-				comm = "asciidoctor -a toc-title=\"#{onthispage}\" -a latest=#{$latest} -a branches=#{$branches} -a branch=#{$latest} -a lang=#{@lang} -a jsdir=../../assets/js -a download_link=https://checkmk.com/download -a linkcss=true -a stylesheet=checkmk.css -a stylesdir=../../assets/css -T \"#{$templates}/templates/slim\" -E slim -a toc=right \"#{$basepath}/#{@filename}\" -D \"#{outdir}\""
+				comm = "asciidoctor -a toc-title=\"#{onthispage}\" -a latest=#{$latest} -a branches=#{$branches} -a branch=#{$latest} -a lang=#{@lang} -a jsdir=../../assets/js -a download_link=https://checkmk.com/download -a linkcss=true -a stylesheet=checkmk.css -a stylesdir=../../assets/css #{preproc} -T \"#{$templates}/templates/slim\" -E slim -a toc=right \"#{srcpath}/#{@filename}\" -D \"#{outdir}\""
 				$stderr.puts comm
 			end
 			IO.popen(comm + " 2>&1") { |o|
@@ -1025,17 +1138,6 @@ class SingleDocFile
 			hdoc = Nokogiri::HTML.parse html
 			head  = hdoc.at_css "head"
 			cnode = hdoc.css("div[id='preamble']")[0]
-			# $stderr.puts cnode # .children[0] # .first_element_child
-			#@errors.each { |e|
-			#	# head.first_element_child.before("<!-- #{e} -->\n")
-			#	head.prepend_child "<!-- #{e} -->\n"
-			#	#cnode.children[1].before("<div id='adocerrors'>" + @errors.join("<br />") +  "</div>")
-			#}
-			#@xmlerrs.each { |e|
-			#	head.prepend_child "<!-- #{e} -->\n"
-			#	cnode.first_element_child.before("<div id='xmlerrors'>" + e.join("<br />") +  "</div>")
-			#}
-			# cnode.prepend_child("<div id='xmlerrors'>" + @xmlerrs.join("<br />") +  "</div>")
 			head.add_child("<style>\n" + File.read(__dir__ + "/docserve.css") + "\n</style>\n")
 			$injectcss.each { |c|
 				head.add_child("<style>\n" + File.read(c) + "\n</style>\n") if File.file? c
@@ -1043,14 +1145,21 @@ class SingleDocFile
 			broken_links = check_links hdoc
 			@broken_links = broken_links
             broken_code = check_codeboxes hdoc
-			total_errors = @errors.size + broken_links.size + @misspelled.size + @missing_includes.size + structerrors + broken_code.size
+			total_errors = @errors.size + broken_links.size + @misspelled.size + @missing_includes.size + @structerrors + broken_code.size
 			$stderr.puts "Total errors encountered: #{total_errors}"
 			if total_errors > 0
 				hname = @filename.sub(/asciidoc$/, 'html')
 				@errorline = "http://localhost:#{$port}/latest#{hname};"
 				@html_errorline = "<tr><td><a href=\"http://localhost:#{$port}/latest#{hname}\" target=\"_blank\">#{hname}</a></td>"
 				enode = "<div id='docserveerrors'>"
-				enode += "<h3>Asciidoctor errors</h3><p class='errmono'>" + @errors.join("<br />") +  "</p>" if @errors.size > 0
+                if @errors.size > 0
+                    enode += "<h3>Asciidoctor errors</h3><p class='errmono'>" + @errors.join("<br />") +  "</p>"
+                    @errorline = @errorline + @errors.size.to_s  + ";"
+                    @html_errorline = @html_errorline + "<td>" + @errors.size.to_s + "</td>"
+                else
+                    @errorline = @errorline + "0;"
+					@html_errorline = @html_errorline + "<td>0</td>"
+                end
 				if broken_links.size > 0
 					enode += "<h3>Broken links</h3><ul>"
 					broken_links.each { |l,p|
@@ -1079,25 +1188,35 @@ class SingleDocFile
 					enode += "<h3>Misspelled or unknown words</h3><p>"
 					enode += @misspelled.join(" ")
 					enode += "</p>"
-					@errorline = @errorline + @misspelled.size.to_s  + ";\n"
-					@html_errorline = @html_errorline + "<td>" + @misspelled.size.to_s + "</td></tr>\n"
+					@errorline = @errorline + @misspelled.size.to_s  + ";"
+					@html_errorline = @html_errorline + "<td>" + @misspelled.size.to_s + "</td>"
 				else
-					@errorline = @errorline + "0;\n"
-					@html_errorline = @html_errorline + "<td>0</td></tr>\n"
+					@errorline = @errorline + "0;"
+					@html_errorline = @html_errorline + "<td>0</td>"
 				end
-                if broken_code.size > 0
-                    enode += "<h3>Found codeboxes with non ASCII chars</h3><p>"
-                    broken_code.each { |n|
-                        enode += "<pre class='pygments highlight'>" + n + '</pre>'
-                    }
-                end
-				if structerrors > 0
+				if @structerrors > 0
 					enode += "<h3>Structure not matching</h3><p><b>This:</b> "
 					enode += struct_delta[0].to_html
 					enode += "</p><p><b>Other:</b> "
 					enode += struct_delta[1].to_html
 					enode += "</p>"
+                    @errorline = @errorline + "1;"
+                    @html_errorline = @html_errorline + "<td>1</td>"
+                else
+                    @errorline = @errorline + "0;"
+                    @html_errorline = @html_errorline + "<td>0</td>"
 				end
+                if broken_code.size > 0
+                    enode += "<h3>Found codeboxes with non ASCII chars or clickable link</h3><p>"
+                    broken_code.each { |n|
+                        enode += "<pre class='pygments highlight'>" + n + '</pre>'
+                    }
+                    @errorline = @errorline + broken_code.size.to_s + ";\n"
+                    @html_errorline = @html_errorline + "<td>" + broken_code.size.to_s + "</td></tr>\n"
+                else
+                    @errorline = @errorline + "0;\n"
+                    @html_errorline = @html_errorline + "<td>0</td></tr>\n"
+                end
 				enode += "</div>\n"
 				if cnode.nil?
 					$stderr.puts "Preamble not found!"
@@ -1108,7 +1227,8 @@ class SingleDocFile
 				end
 			end
 			mcont = hdoc.css("div[class='main-nav__content']")[0]
-			mcont.inner_html = $cachedfiles["/" + @lang + "/menu.asciidoc"].to_html unless mcont.nil?
+            xmenu = "/menu.html"
+			mcont.inner_html = $cachedfiles["/" + @lang + xmenu].to_html unless mcont.nil?
 			body  = hdoc.at_css "body"
 			body.add_child("<script>\n" + 
 				File.read(__dir__ + "/autoreload.js").
@@ -1128,13 +1248,14 @@ class SingleDocFile
 		end
 		return html
 	end
-	attr_accessor :mtime, :errorline, :html_errorline, :words, :wordscount, :maxwords, :lang, :filename, :errors, :misspelled, :broken_links, :anchors, :docstruc, :structerrors
+	attr_accessor :mtime, :errorline, :html_errorline, :words, :wordscount, :maxwords, :lang, :filename, :errors, :misspelled, :broken_links, :anchors, :docstruc, :structerrors, :images
 end
 
 class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 	def do_GET (request, response)
 		html = nil
 		path = request.path
+        spath = path.gsub(/^\/latest/, '')
 		response.set_redirect(WEBrick::HTTPStatus::TemporaryRedirect, "/latest/en/") if path == "/"
 		response.set_redirect(WEBrick::HTTPStatus::TemporaryRedirect, "/latest/en/index.html") if path == "/latest/en/" || path == "/latest/en"
 		response.set_redirect(WEBrick::HTTPStatus::TemporaryRedirect, "/latest/de/index.html") if path == "/latest/de/" || path == "/latest/de"
@@ -1146,18 +1267,18 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 		create_filelist unless $allowed.include? path.strip
 		if $html.include? path.strip
 			otherstruc = nil
-			if $cachedfiles.has_key? path.strip
-				$stderr.puts "Trying to serve from memory cache... #{path.strip}"
+			if $cachedfiles.has_key? spath.strip
+				$stderr.puts "Trying to serve from memory cache... #{spath.strip}"
 			else
 				filename = "/" + ptoks[-2] + "/" + ptoks[-1].sub(/\.html$/, ".asciidoc")
 				$stderr.puts "Add file to cache #{filename}"
 				s = SingleDocFile.new(filename, 1)
-				$cachedfiles[path] = s
+				$cachedfiles[spath] = s
 			end
 			if $structure > 0
 				otherstruc = []
 				otherlangs = [ "de", "en" ] - [ ptoks[-2] ]
-				otherfile = "/" + ptoks[-3] + "/" + otherlangs[0] + "/" + ptoks[-1]
+				otherfile = "/" + otherlangs[0] + "/" + ptoks[-1]
 				if $html.include?("/" + ptoks[-3] + "/" + otherlangs[0] + "/" + ptoks[-1])
 					unless $cachedfiles.has_key? otherfile
 						otherfilename = "/" + otherlangs[0] + "/" + ptoks[-1].sub(/\.html$/, ".asciidoc")
@@ -1168,7 +1289,7 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 				end
 				puts otherstruc.join(", ")
  			end
-			html = $cachedfiles[path].to_html(otherstruc)
+			html = $cachedfiles[spath].to_html(otherstruc)
 			response.status = status
 			response.content_type = "text/html"
 			response.body = html
@@ -1192,8 +1313,11 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 			elsif ptoks.include?("favicon.ico")
 				html = File.read __dir__ + "/" + ptoks[-1]
 				ctype= $mimetypes["ico"]
+            elsif ptoks.include?("favicon.png")
+				html = File.read __dir__ + "/" + ptoks[-1]
+				ctype= $mimetypes["png"]
 			elsif ptoks.include?("errors.csv")
-				html = "\Filename\";\"Broken links\";\"Missing includes\";\"Spellcheck errors\";\n"
+				html = "\Filename\";\"Asciidoc errors\";\"Broken links\";\"Missing includes\";\"Spellcheck errors\";\"Structure mismatch\";\"Non-ASCII in code box\";\n"
 				$cachedfiles.each { |f, o|
 					unless o.errorline.nil?
 						html = html + o.errorline
@@ -1202,11 +1326,13 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 				ctype= $mimetypes["csv"]
 			elsif ptoks.include?("errors.html")
 				html = "<!DOCTYPE html>\n<html><head><title>Rabbithole</title></head><body>\n" +
-					"<table><tr><td>Filename</td><td>Broken links</td><td>Missing includes</td>" +
-					"<td>Spellcheck errors</td></tr>\n"
-				$cachedfiles.each { |f, o|
-					unless o.html_errorline.nil?
-						html = html + o.html_errorline
+					"<table><tr><td><b>Filename</b></td><td><b>Asciidoc errors</b><td><b>Broken links</b></td>" +
+                    "<td><b>Missing includes</b></td><td><b>Spellcheck errors</b></td>" +
+                    "<td><b>Structure mismatch</b></td><td><b>Code box with non-ASCII or link</b></td></tr>\n"
+				$cachedfiles.keys.uniq.sort.each { |f|
+					unless $cachedfiles[f].html_errorline.nil?
+                        puts "+" + f + "+"
+						html = html + $cachedfiles[f].html_errorline
 					end
 				}
 				html = html + "</table></body></html>"
@@ -1220,13 +1346,81 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 				}
 				html = html + "</table></body></html>"
 				ctype= $mimetypes["html"]
+            elsif ptoks.include?("images.html")
+                allimages = []
+                original = 0
+                $cachedfiles.each { |f, o|
+                    allimages = allimages + o.images
+                }
+                allimages.uniq!
+                unused = $images - allimages
+                html = "<!DOCTYPE html>\n<html><head> <meta charset=\"UTF-8\"> <title>Imagestats</title></head><body>\n"
+                html = html + "<p>Images present: " + $images.length.to_s
+                html = html + "\n<br />Images used: " + allimages.length.to_s
+                list = ''
+                unused.each { |i|
+                    if i =~ /_original\./
+                        original += 1
+                    else
+                        list = list + "<li><a href='/latest/en/" + i + "'>" + i.gsub(/^\.\.\//, '') + "</a></li>\n"
+                    end
+                }
+                html = html + "\n<br />Original images: " + original.to_s
+                html = html + "\n</p><h2>Unused images</h2>\n<ul>\n" + list + "</ul></body></html>"
+                ctype= $mimetypes["html"]
+            elsif ptoks.include?("images.txt")
+                allimages = []
+                $cachedfiles.each { |f, o|
+                    allimages = allimages + o.images
+                }
+                allimages.uniq!
+                unused = $images - allimages
+                html = ''
+                unused.each { |i|
+                    html = html + i.gsub(/^\.\.\//, '') + "\n" unless i =~ /_original\./
+                }
+                ctype= $mimetypes["txt"]
+            elsif ptoks.include?("links.html")
+                html = "<!DOCTYPE html>\n<html><head> <meta charset=\"UTF-8\"> <title>Linkstats</title></head><body>\n"
+                html = html + "<h2>Broken links</h2>\n<ul>\n"
+                $linksusedby.keys.sort.each { |l|
+                    unless $cachedlinks[l].ok == true
+                        html = html + "<li><a href='" + l + "'>" + l + "</a> (" + $cachedlinks[l].errorline + ") Used by:\n"
+                        $linksusedby[l].each { |t|
+                            html = html + "<a href='/latest" + t + "'>" + t + "</a>\n"
+                        }
+                        html = html + "</li>\n"
+                    end
+                }
+                html = html + "</ul>\n<h2>Working links with redirect</h2>\n<ul>\n"
+                $linksusedby.keys.sort.each { |l|
+                    if $cachedlinks[l].ok == true && $cachedlinks[l].statuscode > 299
+                        html = html + "<li><a href='" + l + "'>" + l + "</a> (" + $cachedlinks[l].statuscode.to_s + ")  Used by:\n"
+                        $linksusedby[l].each { |t|
+                            html = html + "<a href='/latest" + t + "'>" + t + "</a>\n"
+                        }
+                        html = html + "</li>\n"
+                    end
+                }
+                html = html + "</ul>\n<h2>Working links</h2>\n<ul>\n"
+                $linksusedby.keys.sort.each { |l|
+                    if $cachedlinks[l].ok == true && $cachedlinks[l].statuscode < 300
+                        html = html + "<li><a href='" + l + "'>" + l + "</a> Used by:\n"
+                        $linksusedby[l].each { |t|
+                            html = html + "<a href='/latest" + t + "'>" + t + "</a>\n"
+                        }
+                        html = html + "</li>\n"
+                    end
+                }
+                html = html + "\n</ul></body></html>"
+                ctype= $mimetypes["html"]
 			elsif ptoks.include?("lunr.index.en.js") || ptoks.include?("lunr.index.de.js")
 				ttoks = ptoks[-1].split(".")
 				html = $lunr[ttoks[2]]
 				ctype= $mimetypes["js"]
 			elsif ptoks.include?("last_change")
 				# Assume path like "last_change/en/agent_linux.html"
-				html_path = "/latest/" + ptoks[-2] + "/" + ptoks[-1]
+				html_path = "/" + ptoks[-2] + "/" + ptoks[-1]
 				if $cachedfiles.has_key? html_path
 					html = "{ \"last-change\" : " + $cachedfiles[html_path].check_age.to_i.to_s + " }"
 				else
@@ -1246,8 +1440,16 @@ class MyServlet < WEBrick::HTTPServlet::AbstractServlet
 		end
 	end
 end
-    
+
 create_config
+identify_dir_structure if $newdir.nil?
+if $newdir.nil?
+    puts "Could not identify directory structure!"
+    exit 1
+elsif $cachedir.nil?
+    puts "New directory structure needs a cachedir for building!"
+    exit 1
+end
 prepare_cache
 prepare_menu
 prepare_hunspell
@@ -1270,11 +1472,30 @@ if $buildall > 0 || $prebuild.size > 0
 		if html2build.include?(f) || $buildall > 0
 			$stderr.puts "---> INFO: pre-building requested, building #{f}"
 			filename = f.sub(/html$/, 'asciidoc').sub(/^\/latest/, '')
+            spath = f.sub(/^\/latest/, '')
 			s = SingleDocFile.new(filename, 1)
-			$cachedfiles[filename] = s
-			html = $cachedfiles[filename].to_html
-			$total_errors += $cachedfiles[filename].broken_links.keys
-			$total_errors += $cachedfiles[filename].misspelled
+			$cachedfiles[spath] = s
+            otherstruc = nil
+            if $structure > 0
+                ptoks = f.split('/')
+				otherstruc = []
+				otherlangs = [ "de", "en" ] - [ ptoks[-2] ]
+				otherfile = "/" + otherlangs[0] + "/" + ptoks[-1]
+				if $html.include?("/" + ptoks[-3] + "/" + otherlangs[0] + "/" + ptoks[-1])
+					unless $cachedfiles.has_key? otherfile
+						otherfilename = "/" + otherlangs[0] + "/" + ptoks[-1].sub(/\.html$/, ".asciidoc")
+						osdoc = SingleDocFile.new(otherfilename, 1)
+						$cachedfiles[otherfile] = osdoc
+					end
+					otherstruc = $cachedfiles[otherfile].check_structure
+				end
+				puts otherstruc.join(", ")
+ 			end
+			html = $cachedfiles[spath].to_html(otherstruc)
+			# html = $cachedfiles[filename].to_html
+			$total_errors += $cachedfiles[spath].broken_links.keys
+			$total_errors += $cachedfiles[spath].misspelled
+            $total_errors += [ 'structure' ] if $cachedfiles[spath].structerrors > 0
 			$files_built += 1
 		end
 	}

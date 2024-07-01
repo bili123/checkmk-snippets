@@ -213,11 +213,20 @@ def create_softlinks
     $onthispage.each { |lang, s| 
         FileUtils.mkdir_p "#{$cachedir}/src/#{lang}"
         subdirs.each { |d|
-            FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.a*doc"), "#{$cachedir}/src/#{lang}", force: true)
-            FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.xml"), "#{$cachedir}/src/#{lang}", force: true)
-            FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.txt"), "#{$cachedir}/src/#{lang}", force: true)
+            begin
+                FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.a*doc"), "#{$cachedir}/src/#{lang}/", force: true)
+            rescue
+            end
+            begin
+                FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.xml"), "#{$cachedir}/src/#{lang}/", force: true)
+            rescue
+            end 
+            begin
+                FileUtils.ln_s(Dir.glob("#{$basepath}/src/#{d}/#{lang}/*.txt"), "#{$cachedir}/src/#{lang}/", force: true)
+            rescue
+            end
         }
-        FileUtils.ln_s(Dir.glob("#{$basepath}/src/code/*.a*doc"), "#{$cachedir}/src/#{lang}", force: true)
+        FileUtils.ln_s(Dir.glob("#{$basepath}/src/code/*.a*doc"), "#{$cachedir}/src/#{lang}/", force: true)
     }
 end
 
@@ -443,11 +452,15 @@ class SingleIncludeFile
 	
 	def check_age
         srcpath = $basepath
-        create_softlinks
         if $newdir > 0
             srcpath = "#{$cachedir}/src"
         end
-		@mtime = File.mtime(srcpath + @filename)
+        begin
+            @mtime = File.mtime(srcpath + @filename)
+        rescue
+            create_softlinks
+            @mtime = File.mtime(srcpath + @filename)
+        end
 		return @mtime
 	end
 	
@@ -792,11 +805,16 @@ class SingleDocFile
 		@ignored = Array.new
         @nonascii = Array.new
         srcpath = $basepath
-        create_softlinks
+        # create_softlinks
         if $newdir > 0
             srcpath = "#{$cachedir}/src"
         end
-		@mtime = File.mtime(srcpath + @filename)
+        begin
+            @mtime = File.mtime(srcpath + @filename)
+        rescue
+            create_softlinks
+            @mtime = File.mtime(srcpath + @filename)
+        end
 		File.open(srcpath + @filename).each { |line|
 			if line =~ /include::(.*?)\[/
 				ifile = $1
@@ -822,14 +840,20 @@ class SingleDocFile
 	def check_includes
 		latest_include = Time.at 0
         srcpath = $basepath
-        create_softlinks
+        # create_softlinks
         if $newdir > 0
             srcpath = "#{$cachedir}/src"
         end
 		@missing_includes = Array.new
 		@includes.each { |i|
+            create_softlinks if !File.file?(srcpath + i)
 			if File.file?(srcpath + i) && $cachedincludes.has_key?(i)
-				mtime = $cachedincludes[i].check_age
+                begin
+                    mtime = $cachedincludes[i].check_age
+                rescue
+                    create_softlinks
+                    mtime = $cachedincludes[i].check_age
+                end
 				latest_include = mtime if mtime > latest_include
 			else
 				@missing_includes.push i
@@ -851,11 +875,15 @@ class SingleDocFile
 	def check_age
 		imtime = check_includes
         srcpath = $basepath
-        create_softlinks
         if $newdir > 0
             srcpath = "#{$cachedir}/src"
         end
-		fmtime = File.mtime(srcpath + @filename)
+        begin
+            fmtime = File.mtime(srcpath + @filename)
+        rescue
+            create_softlinks
+            fmtime = File.mtime(srcpath + @filename)
+        end
 		return imtime if imtime > fmtime
 		return fmtime
 	end
@@ -939,7 +967,7 @@ class SingleDocFile
 	
 	def nicify_startpage(hdoc) # expects HTML tree as Nokogiri object
         srcpath = $basepath
-        create_softlinks
+        # create_softlinks
         if $newdir > 0
             srcpath = "#{$cachedir}/src"
         end
@@ -1009,7 +1037,7 @@ class SingleDocFile
 	def get_autolist(name, hdoc)
 		h = nil
         srcpath = $basepath
-        create_softlinks
+        # create_softlinks
         if $newdir > 0
             srcpath = "#{$cachedir}/src"
         end
@@ -1072,7 +1100,7 @@ class SingleDocFile
 			onthispage = $onthispage[@lang]
 			comm = ""
             srcpath = $basepath
-            create_softlinks
+            # create_softlinks
             if $newdir > 0
                 srcpath = "#{$cachedir}/src"
             end
